@@ -1,6 +1,10 @@
+; charset appears at both levels: (libraries ...) for its type at
+; level 0, (static_libraries ...) for the shifted import that lets
+; Charset_set's macros call it at level -1 (the closure -- charset,
+; ocaml_intrinsics, ocaml_intrinsics_kernel -- is resolved by dune).
 (library
  (public_name charmatch)
  (modules charmatch)
- (libraries dynlink compiler-libs metaocaml)
- (flags (:standard "-open" "Codelib"))
+ (libraries charset)
+ (static_libraries charset)
  (synopsis "Pattern-matching generation for characters"))
