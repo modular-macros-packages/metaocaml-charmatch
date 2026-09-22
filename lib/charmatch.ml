@@ -5,85 +5,101 @@
  * See the file LICENSE for details.
  *)
 
+
 type interval = char * char
 
 type options = { match_type: [`table | `ranges] }
-let default_options = { match_type = `table }
 
-module Mk =
-struct
-  open Parsetree
+$gen default_options : unit -> options = fun () -> { match_type = `table }
 
-  let pattern : pattern_desc -> pattern =
-    Ast_helper.Pat.mk
-
-  let interval : char -> char -> pattern =
-    fun l h -> if l <> h
-               then pattern @@ Ppat_interval (Ast_helper.Const.char l, Ast_helper.Const.char h)
-               else pattern @@ Ppat_constant (Ast_helper.Const.char l)
-
-  let int_pattern : int -> pattern =
-    fun i -> pattern @@ Ppat_constant (Ast_helper.Const.int i)
-
-  let intervals : interval list -> pattern = function
-    | [] -> failwith "empty interval list not supported"
-    | (l,h)::is ->
-       List.fold_left (fun p (l,h) -> pattern @@ Ppat_or (interval l h, p))
-         (interval l h) is
-
-  let case : 'a. pattern -> 'a code -> (_ -> 'a) pat_code =
-    fun pat code ->
-    let fv, rhs = Obj.magic code in
-    (Obj.magic (fv, Ast_helper.Exp.function_ [{ pparam_loc = Location.none;
-                                                pparam_desc = Pparam_val (Nolabel, None, pat) } ]
-                      None (Pfunction_body rhs)))
+module type SET = sig
+  type t
+  $gen cardinal : t -> int
+  $gen fold : 'acc. (char -> 'acc -> 'acc) -> t -> 'acc -> 'acc
+  $gen iter : (char -> unit) -> t -> unit
+  $gen union : t -> t -> t
+  $gen empty : unit -> t
 end
 
-module Make(Charset : Set.S with type elt = char) =
+module Make [C : SET] =
 struct
+  $gen intervals : C.t -> interval list = fun cs ->
+    let add ch = function
+      | (l, h) :: tail when Char.code ch = succ (Char.code h) -> (l, ch) :: tail
+      | l -> (ch, ch) :: l
+    in
+    List.rev (C.fold add cs [])
 
-  let intervals : Charset.t -> interval list =
-    let add c = function
-      | (l,h) :: tail when Char.code c = succ (Char.code h) -> (l, c) :: tail
-      | l -> (c, c) :: l
-    in fun c -> List.rev (Charset.fold add c [])
+  $gen covering : 'a. (C.t * 'a) list -> bool = fun cases ->
+    C.cardinal
+      (List.fold_left (fun s (cs, _) -> C.union s cs) (C.empty ()) cases)
+    = 256
 
-  let ipat c = Mk.intervals (intervals c)
-
-  let covering : (Charset.t * _) list -> bool =
-    fun cases ->
-    Charset.(cardinal (List.fold_left (fun s (c,_) -> union s c) empty cases) = 256)
-
-  let table : (Charset.t * _) list -> string =
-    fun cases ->
+  $gen table : 'a. (C.t * 'a) list -> string = fun cases ->
     let n = List.length cases in
-    let b = Bytes.make 256 (Char.chr (min n 255)) (* There may be 256 cases *)  in
-    ListLabels.iteri cases
-      ~f:(fun i (cs,_) -> Charset.iter (fun c -> Bytes.set b (Char.code c) (Char.chr i)) cs);
+    let b = Bytes.make 256 (Char.chr (min n 255)) (* There may be 256 cases *) in
+    List.iteri
+      (fun i (cs, _) -> C.iter (fun c -> Bytes.set b (Char.code c) (Char.chr i)) cs)
+      cases;
     Bytes.unsafe_to_string b
 
-  let ifmem_match : 'a. char code -> ?otherwise:'a code -> (Charset.t * 'a code) list -> 'a code =
+  $gen default_otherwise : 'a. unit -> 'a expr = fun () ->
+    << raise (Match_failure ("charmatch-generated", 0, 0)) >>
+
+    $gen cond : interval list -> char expr -> bool expr = fun is x ->
+    let one (l, h) =
+      if l = h then << $x = $(Expr.char l) >>
+      else << $(Expr.char l) <= $x && $x <= $(Expr.char h) >>
+    in
+    match is with
+    | [] -> failwith "empty interval list not supported"
+    | i :: is -> List.fold_left (fun acc i -> << $acc || $(one i) >>) (one i) is
+
+  $gen ifmem_ranges : 'a. char expr -> ?otherwise:'a expr -> (C.t * 'a expr) list -> 'a expr =
     fun c ?otherwise cases ->
-     make_match c
-       (List.map (fun (lhs, rhs) -> Mk.case (ipat lhs) rhs) cases
-        @ match otherwise with None -> []
-                             | Some e -> [.< fun _ -> .~e >. [@metaocaml.functionliteral] ])
+    let tail () = match otherwise with
+      | Some e -> e
+      | None -> default_otherwise ()
+    in
+    let rec build x = function
+      | [] -> tail ()
+      | (cs, rhs) :: rest ->
+        << if $(cond (intervals cs) x) then $rhs else $(build x rest) >>
+    in
+        << let x = $c in $(build <<x>> cases) >>
 
-  let default_otherwise = .< raise (Match_failure ("charmatch-generated", 0, 0)) >.
-
-  let ifmem_table : 'a. char code -> ?otherwise:'a code -> (Charset.t * 'a code) list -> 'a code =
+  $gen ifmem_table : 'a. char expr -> ?otherwise:'a expr -> (C.t * 'a expr) list -> 'a expr =
     fun c ?otherwise cases ->
     let len = List.length cases in
     let covered = covering cases in
     let t = table cases in
-    make_match .<Char.code (String.unsafe_get t (Char.code .~c))>.
-      (List.mapi (fun i (_,rhs) -> if i+1 = len && covered then .< fun _ -> .~rhs >. [@metaocaml.functionliteral]
-                                   else Mk.case (Mk.int_pattern i) rhs) cases
-       @ if covered then []
-         else [.< fun _ -> .~(Option.value otherwise ~default:default_otherwise) >. [@metaocaml.functionliteral]])
+    let rec build i k = function
+      | [] -> (match otherwise with
+               | Some e -> e
+               | None -> default_otherwise ())
+      | [ (_, rhs) ] when k + 1 = len && covered -> rhs
+      | (_, rhs) :: rest ->
+        << if $i = $(Expr.int k) then $rhs else $(build i (k + 1) rest) >>
+    in
+    << let i = Char.code (String.unsafe_get $(Expr.string t) (Char.code $c)) in
+       $(build <<i>> 0 cases) >>
 
-  let ifmem ?(options=default_options) c ?otherwise l =
-    (match options.match_type with `table -> ifmem_table | `ranges -> ifmem_match) c ?otherwise l
+  $gen ifmem : 'a. ?options:options -> char expr -> ?otherwise:'a expr -> (C.t * 'a expr) list -> 'a expr =
+    fun ?options c ?otherwise l ->
+    let options = match options with Some o -> o | None -> default_options () in
+    match options.match_type with
+    | `table -> ifmem_table c ?otherwise l
+    | `ranges -> ifmem_ranges c ?otherwise l
 end
 
-include Make(Set.Make(Char))
+module Charset_set = struct
+  type t = Charset.t
+  $gen cardinal : t -> int = fun s -> Charset.cardinal s
+  $gen fold : 'acc. (char -> 'acc -> 'acc) -> t -> 'acc -> 'acc =
+    fun f s acc -> Charset.fold f s acc
+  $gen iter : (char -> unit) -> t -> unit = fun f s -> Charset.iter f s
+  $gen union : t -> t -> t = fun s1 s2 -> Charset.union s1 s2
+  $gen empty : unit -> t = fun () -> Charset.empty
+end
+
+include Make[Charset_set]
