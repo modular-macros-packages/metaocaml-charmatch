@@ -14,10 +14,9 @@ build: [
 ]
 depends: [
    "ocaml"
-   "dune"
-   "ocamlfind"
+   "dune" {>= "3.24"}
    "ocaml-variants"
-     {= "5.3.0+BER"}
-   "charset" {with-test}
+     {= "5.5.0+macocaml-prototype-2026-10-08"}
+   "charset"
    "ounit2" {with-test}
 ]

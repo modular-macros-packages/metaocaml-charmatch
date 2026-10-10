@@ -7,14 +7,32 @@
 
 type options =
   { match_type: [`table | `ranges]
-    (** Whether to generate a lookup table or a collection range patterns 
-        for the character match (default [`table]) *) }
+    (** [`table] (the default): a 256-byte class lookup and a
+        constant-time jump table on the class; [`ranges]: no table, a
+        switch on the character code over each class's intervals (the
+        backend chooses comparisons or a jump table by density). *) }
 
-val default_options : options
+(** [{ match_type = `table }].  A static value: a level-0 value would
+    be invisible to compile-time callers. *)
+$val default_options : options
 
-module Make(Charset: Set.S with type elt = char) :
-sig
-  val ifmem : ?options:options -> char code -> ?otherwise:'a code -> (Charset.t * 'a code) list -> 'a code
+(** The set operations the generator consumes at generation time. *)
+module type SET = sig
+  type t
+  $val cardinal : t -> int
+  $val fold : 'acc. (char -> 'acc -> 'acc) -> t -> 'acc -> 'acc
+  $val iter : (char -> unit) -> t -> unit
+  $val union : t -> t -> t
+  $val empty : t
 end
 
-include module type of Make(Set.Make(Char))
+module Make $(C : SET) : sig
+  $val ifmem : 'a. ?options:options -> char expr ->
+    ?otherwise:'a expr -> (C.t * 'a expr) list -> 'a expr
+end
+
+(** The default instance, over the charset package. *)
+module Charset_set : SET with type t = Charset.t
+
+$val ifmem : 'a. ?options:options -> char expr ->
+  ?otherwise:'a expr -> (Charset_set.t * 'a expr) list -> 'a expr

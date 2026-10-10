@@ -5,85 +5,101 @@
  * See the file LICENSE for details.
  *)
 
+
 type interval = char * char
 
 type options = { match_type: [`table | `ranges] }
-let default_options = { match_type = `table }
 
-module Mk =
-struct
-  open Parsetree
+$let default_options : options = { match_type = `table }
 
-  let pattern : pattern_desc -> pattern =
-    Ast_helper.Pat.mk
-
-  let interval : char -> char -> pattern =
-    fun l h -> if l <> h
-               then pattern @@ Ppat_interval (Ast_helper.Const.char l, Ast_helper.Const.char h)
-               else pattern @@ Ppat_constant (Ast_helper.Const.char l)
-
-  let int_pattern : int -> pattern =
-    fun i -> pattern @@ Ppat_constant (Ast_helper.Const.int i)
-
-  let intervals : interval list -> pattern = function
-    | [] -> failwith "empty interval list not supported"
-    | (l,h)::is ->
-       List.fold_left (fun p (l,h) -> pattern @@ Ppat_or (interval l h, p))
-         (interval l h) is
-
-  let case : 'a. pattern -> 'a code -> (_ -> 'a) pat_code =
-    fun pat code ->
-    let fv, rhs = Obj.magic code in
-    (Obj.magic (fv, Ast_helper.Exp.function_ [{ pparam_loc = Location.none;
-                                                pparam_desc = Pparam_val (Nolabel, None, pat) } ]
-                      None (Pfunction_body rhs)))
+module type SET = sig
+  type t
+  $val cardinal : t -> int
+  $val fold : 'acc. (char -> 'acc -> 'acc) -> t -> 'acc -> 'acc
+  $val iter : (char -> unit) -> t -> unit
+  $val union : t -> t -> t
+  $val empty : t
 end
 
-module Make(Charset : Set.S with type elt = char) =
+module Make $(C : SET) =
 struct
-
-  let intervals : Charset.t -> interval list =
-    let add c = function
-      | (l,h) :: tail when Char.code c = succ (Char.code h) -> (l, c) :: tail
-      | l -> (c, c) :: l
-    in fun c -> List.rev (Charset.fold add c [])
-
-  let ipat c = Mk.intervals (intervals c)
-
-  let covering : (Charset.t * _) list -> bool =
-    fun cases ->
-    Charset.(cardinal (List.fold_left (fun s (c,_) -> union s c) empty cases) = 256)
-
-  let table : (Charset.t * _) list -> string =
-    fun cases ->
+    $let labels : 'a. (C.t * 'a) list -> int array = fun cases ->
     let n = List.length cases in
-    let b = Bytes.make 256 (Char.chr (min n 255)) (* There may be 256 cases *)  in
-    ListLabels.iteri cases
-      ~f:(fun i (cs,_) -> Charset.iter (fun c -> Bytes.set b (Char.code c) (Char.chr i)) cs);
-    Bytes.unsafe_to_string b
+    let a = Array.make 256 n in
+    List.iteri
+      (fun i (cs, _) ->
+        C.iter (fun c -> let k = Char.code c in if a.(k) = n then a.(k) <- i) cs)
+      cases;
+    a
 
-  let ifmem_match : 'a. char code -> ?otherwise:'a code -> (Charset.t * 'a code) list -> 'a code =
+  $let default_otherwise : 'a. unit -> 'a expr = fun () ->
+    << raise (Match_failure ("charmatch-generated", 0, 0)) >>
+
+    $let body : 'a. 'a expr array -> 'a expr option -> int -> 'a expr =
+    fun bodies otherwise k ->
+    if k < Array.length bodies then bodies.(k)
+    else match otherwise with Some e -> e | None -> default_otherwise ()
+
+  $let ifmem_table : 'a. char expr -> ?otherwise:'a expr -> (C.t * 'a expr) list -> 'a expr =
     fun c ?otherwise cases ->
-     make_match c
-       (List.map (fun (lhs, rhs) -> Mk.case (ipat lhs) rhs) cases
-        @ match otherwise with None -> []
-                             | Some e -> [.< fun _ -> .~e >. [@metaocaml.functionliteral] ])
+    let n = List.length cases in
+    let bodies = Array.of_list (List.map snd cases) in
+    let ls = labels cases in
+    let covered = Array.for_all (fun l -> l < n) ls in
+    let t = String.init 256 (fun k -> Char.chr (min ls.(k) 255)) (* There may be 256 cases *) in
+        let numconsts = if covered then n else n + 1 in
+    if numconsts <= 1 then body bodies otherwise 0
+    else
+      let cases = List.init n (fun k -> (Char.chr k, bodies.(k))) in
+      let fail = if covered then None else Some (body bodies otherwise n) in
+      Expr.switch (module Char)
+        << String.unsafe_get $(Expr.string t) (Char.code $c) >>
+        ~numconsts cases fail
 
-  let default_otherwise = .< raise (Match_failure ("charmatch-generated", 0, 0)) >.
+    $let runs : int array -> (int * int * int) array = fun ls ->
+    let acc = ref [] and lo = ref 0 in
+    for k = 1 to 256 do
+      if k = 256 || ls.(k) <> ls.(!lo) then begin
+        acc := (!lo, k - 1, ls.(!lo)) :: !acc; lo := k
+      end
+    done;
+    Array.of_list (List.rev !acc)
 
-  let ifmem_table : 'a. char code -> ?otherwise:'a code -> (Charset.t * 'a code) list -> 'a code =
+  $let ifmem_ranges : 'a. char expr -> ?otherwise:'a expr -> (C.t * 'a expr) list -> 'a expr =
     fun c ?otherwise cases ->
-    let len = List.length cases in
-    let covered = covering cases in
-    let t = table cases in
-    make_match .<Char.code (String.unsafe_get t (Char.code .~c))>.
-      (List.mapi (fun i (_,rhs) -> if i+1 = len && covered then .< fun _ -> .~rhs >. [@metaocaml.functionliteral]
-                                   else Mk.case (Mk.int_pattern i) rhs) cases
-       @ if covered then []
-         else [.< fun _ -> .~(Option.value otherwise ~default:default_otherwise) >. [@metaocaml.functionliteral]])
+    let n = List.length cases in
+    let bodies = Array.of_list (List.map snd cases) in
+    let rs = runs (labels cases) in
+    if Array.length rs = 1 then (let (_, _, l) = rs.(0) in body bodies otherwise l)
+    else
+            let ivs = Array.make n [] in
+      Array.iter (fun (lo, hi, l) ->
+          if l < n then ivs.(l) <- (Char.chr lo, Char.chr hi) :: ivs.(l)) rs;
+      let groups =
+        List.filter_map (fun k -> if ivs.(k) = [] then None
+                                  else Some (List.rev ivs.(k), bodies.(k)))
+          (List.init n Fun.id) in
+      let fail =
+        if Array.exists (fun (_, _, l) -> l = n) rs
+        then Some (body bodies otherwise n) else None in
+      Expr.switch_intervals (module Char) c ~numconsts:256 groups fail
 
-  let ifmem ?(options=default_options) c ?otherwise l =
-    (match options.match_type with `table -> ifmem_table | `ranges -> ifmem_match) c ?otherwise l
+  $let ifmem : 'a. ?options:options -> char expr -> ?otherwise:'a expr -> (C.t * 'a expr) list -> 'a expr =
+    fun ?options c ?otherwise l ->
+    let options = match options with Some o -> o | None -> default_options in
+    match options.match_type with
+    | `table -> ifmem_table c ?otherwise l
+    | `ranges -> ifmem_ranges c ?otherwise l
 end
 
-include Make(Set.Make(Char))
+module Charset_set = struct
+  type t = Charset.t
+  $let cardinal : t -> int = fun s -> Charset.cardinal s
+  $let fold : 'acc. (char -> 'acc -> 'acc) -> t -> 'acc -> 'acc =
+    fun f s acc -> Charset.fold f s acc
+  $let iter : (char -> unit) -> t -> unit = fun f s -> Charset.iter f s
+  $let union : t -> t -> t = fun s1 s2 -> Charset.union s1 s2
+  $let empty : t = Charset.empty
+end
+
+include Make$(Charset_set)

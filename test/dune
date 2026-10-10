@@ -1,5 +1,19 @@
+; charmatch's macros arrive at level -1 through the ordinary import;
+; charset is additionally shift-imported so the tests' own macros can
+; build charsets at generation time.
+(executable
+ (name smoke)
+ (modules smoke)
+ (libraries charmatch charset)
+ (static_libraries charset))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./smoke.exe)))
+
 (test
  (name charmatch_tests)
  (modules charmatch_tests)
- (modes native)
- (libraries ounit2 charset dynlink charmatch metaocaml))
+ (libraries ounit2 charset charmatch)
+ (static_libraries charset))
